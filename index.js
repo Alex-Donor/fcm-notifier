@@ -2,7 +2,6 @@ const admin = require('firebase-admin');
 const express = require('express');
 
 // Инициализация Firebase Admin SDK
-// Ключ сервисного аккаунта берется из переменной окружения
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
@@ -12,18 +11,19 @@ const db = admin.firestore();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Эндпоинт для проверки работоспособности сервера
+// Эндпоинт для проверки работоспособности
 app.get('/', (req, res) => {
-  res.send('✅ FCM Notifier is running');
+  res.send('FCM Notifier is running');
 });
 
-// Функция отправки push-уведомления через FCM
+// Функция для отправки уведомления (FCM v1)
 async function sendNotification(fcmToken, title, body, type, messageId, userName, messageText) {
-  const payload = {
+  // Формируем сообщение для FCM v1
+  const message = {
+    token: fcmToken,
     notification: {
       title: title,
       body: body,
-      sound: 'default'
     },
     data: {
       type: type,
@@ -31,54 +31,63 @@ async function sendNotification(fcmToken, title, body, type, messageId, userName
       userName: userName,
       messageText: messageText,
       title: title
+    },
+    android: {
+      priority: 'high',
+      notification: {
+        sound: 'default',
+        priority: 'high'
+      }
+    },
+    apns: {
+      payload: {
+        aps: {
+          sound: 'default',
+          contentAvailable: true
+        }
+      }
     }
   };
   
   try {
-    await admin.messaging().sendToDevice(fcmToken, payload);
-    console.log(`✅ Уведомление отправлено: ${title} → ${body.substring(0, 50)}...`);
+    const response = await admin.messaging().send(message);
+    console.log(`✅ Уведомление отправлено: ${title} (${response})`);
     return true;
   } catch (error) {
     console.error(`❌ Ошибка отправки уведомления:`, error);
-    
-    // Если токен невалидный, удаляем его из Firestore
-    if (error.code === 'messaging/invalid-registration-token' ||
-        error.code === 'messaging/registration-token-not-registered') {
-      console.log(`🗑️ Удаляем невалидный токен из Firestore`);
-      // Здесь можно добавить логику удаления токена
-    }
     return false;
   }
 }
 
-// Слушаем изменения в коллекции messages (реальное время)
+// Слушаем изменения в коллекции messages
+console.log('🔍 Начинаем прослушивание коллекции messages...');
+
 db.collection('messages').onSnapshot(async (snapshot) => {
+  console.log(`📨 Получено изменение: ${snapshot.docChanges().length} изменений`);
+  
   snapshot.docChanges().forEach(async (change) => {
-    // Обрабатываем только новые добавленные сообщения
     if (change.type === 'added') {
       const message = change.doc.data();
       const messageId = change.doc.id;
       
-      // Игнорируем служебные сообщения о заходе/выходе
-      if (message.type === 'entry') return;
+      console.log(`📨 Новое сообщение от ${message.userName}: ${message.text?.substring(0, 50)}...`);
       
-      const text = message.text || '';
-      const messageText = text;
-      
-      console.log(`📨 Новое сообщение от ${message.userName}: ${text.substring(0, 50)}...`);
-      
-      // ========== 1. Обработка упоминаний @username ==========
-      const mentionRegex = /@([\wа-яА-ЯёЁ]+)/g;
-      const mentions = [];
-      let match;
-      while ((match = mentionRegex.exec(text)) !== null) {
-        mentions.push(match[1]);
+      // Игнорируем служебные сообщения о заходе
+      if (message.type === 'entry') {
+        console.log('⏩ Пропускаем служебное сообщение');
+        return;
       }
       
-      for (const username of mentions) {
+      const text = message.text || '';
+      
+      // ========== 1. Поиск упоминаний ==========
+      const mentionRegex = /@([\wа-яА-ЯёЁ]+)/g;
+      let match;
+      while ((match = mentionRegex.exec(text)) !== null) {
+        const username = match[1];
         console.log(`🔍 Поиск пользователя: ${username}`);
         
-        // Ищем пользователя по имени в коллекции users
+        // Ищем пользователя по имени
         const userQuery = await db.collection('users')
           .where('name', '==', username)
           .limit(1)
@@ -89,8 +98,15 @@ db.collection('messages').onSnapshot(async (snapshot) => {
           const userId = userDoc.id;
           const fcmToken = userDoc.data().fcmToken;
           
+          console.log(`📱 Найден пользователь ${username}, fcmToken: ${fcmToken ? 'есть' : 'нет'}`);
+          
           // Не отправляем уведомление автору сообщения
-          if (userId !== message.userId && fcmToken) {
+          if (userId === message.userId) {
+            console.log(`⏩ Не отправляем уведомление автору сообщения`);
+            continue;
+          }
+          
+          if (fcmToken) {
             console.log(`📤 Отправка уведомления об упоминании для ${username}`);
             await sendNotification(
               fcmToken,
@@ -101,20 +117,18 @@ db.collection('messages').onSnapshot(async (snapshot) => {
               message.userName,
               text
             );
-          } else if (userId === message.userId) {
-            console.log(`⏭️ Пропускаем уведомление для автора сообщения`);
-          } else if (!fcmToken) {
-            console.log(`⚠️ У пользователя ${username} нет FCM токена`);
+          } else {
+            console.log(`⚠️ Нет FCM токена для пользователя ${username}`);
           }
         } else {
-          console.log(`❌ Пользователь ${username} не найден в Firestore`);
+          console.log(`❌ Пользователь ${username} не найден`);
         }
       }
       
-      // ========== 2. Обработка ответов на сообщения ==========
+      // ========== 2. Обработка ответов ==========
       if (message.replyTo && message.replyTo.author) {
         const repliedAuthor = message.replyTo.author;
-        console.log(`💬 Обнаружен ответ пользователю: ${repliedAuthor}`);
+        console.log(`🔍 Ответ на сообщение пользователя: ${repliedAuthor}`);
         
         const userQuery = await db.collection('users')
           .where('name', '==', repliedAuthor)
@@ -125,6 +139,8 @@ db.collection('messages').onSnapshot(async (snapshot) => {
           const userDoc = userQuery.docs[0];
           const userId = userDoc.id;
           const fcmToken = userDoc.data().fcmToken;
+          
+          console.log(`📱 Найден пользователь ${repliedAuthor}, fcmToken: ${fcmToken ? 'есть' : 'нет'}`);
           
           if (userId !== message.userId && fcmToken) {
             console.log(`📤 Отправка уведомления об ответе для ${repliedAuthor}`);
@@ -138,17 +154,19 @@ db.collection('messages').onSnapshot(async (snapshot) => {
               text
             );
           }
+        } else {
+          console.log(`❌ Пользователь ${repliedAuthor} не найден`);
         }
       }
     }
   });
 }, (error) => {
-  console.error('❌ Ошибка подключения к Firestore:', error);
+  console.error('❌ Ошибка Firestore:', error);
 });
 
 // Запуск сервера
 app.listen(PORT, () => {
-  console.log(`✅ FCM Notifier сервер запущен на порту ${PORT}`);
-  console.log(`🕒 Ожидание новых сообщений в Firestore...`);
-  console.log(`🌐 Сервер доступен по адресу: http://localhost:${PORT}`);
+  console.log(`✅ FCM Notifier запущен на порту ${PORT}`);
+  console.log(`📡 Сервер доступен по адресу: http://localhost:${PORT}`);
+  console.log('🔍 Ожидание новых сообщений в Firestore...');
 });
