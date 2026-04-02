@@ -18,7 +18,6 @@ app.get('/', (req, res) => {
 
 // Функция для отправки уведомления (FCM v1)
 async function sendNotification(fcmToken, title, body, type, messageId, userName, messageText) {
-  // Формируем сообщение для FCM v1
   const message = {
     token: fcmToken,
     notification: {
@@ -65,7 +64,8 @@ console.log('🔍 Начинаем прослушивание коллекции
 db.collection('messages').onSnapshot(async (snapshot) => {
   console.log(`📨 Получено изменение: ${snapshot.docChanges().length} изменений`);
   
-  snapshot.docChanges().forEach(async (change) => {
+  // Используем for...of для корректной обработки асинхронных операций
+  for (const change of snapshot.docChanges()) {
     if (change.type === 'added') {
       const message = change.doc.data();
       const messageId = change.doc.id;
@@ -75,19 +75,23 @@ db.collection('messages').onSnapshot(async (snapshot) => {
       // Игнорируем служебные сообщения о заходе
       if (message.type === 'entry') {
         console.log('⏩ Пропускаем служебное сообщение');
-        return;
+        continue;
       }
       
       const text = message.text || '';
       
-      // ========== 1. Поиск упоминаний ==========
-      const mentionRegex = /@([\wа-яА-ЯёЁ]+)/g;
+      // ========== 1. Поиск упоминаний (исправленное регулярное выражение) ==========
+      // Поддерживает форматы @[Имя Пользователя] и @Имя
+      const mentionRegex = /@\[([^\]]+)\]|@([\wа-яА-ЯёЁ]+)/g;
       let match;
       while ((match = mentionRegex.exec(text)) !== null) {
-        const username = match[1];
+        // Имя может быть в группе 1 (если формат @[...]) или в группе 2 (если @слово)
+        const username = (match[1] || match[2]).trim();
+        if (!username) continue;
+        
         console.log(`🔍 Поиск пользователя: ${username}`);
         
-        // Ищем пользователя по имени
+        // Ищем пользователя по имени (регистронезависимый поиск)
         const userQuery = await db.collection('users')
           .where('name', '==', username)
           .limit(1)
@@ -159,7 +163,7 @@ db.collection('messages').onSnapshot(async (snapshot) => {
         }
       }
     }
-  });
+  }
 }, (error) => {
   console.error('❌ Ошибка Firestore:', error);
 });
