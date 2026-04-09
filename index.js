@@ -20,34 +20,24 @@ app.get('/', (req, res) => {
 async function sendNotification(fcmToken, title, body, type, messageId, userName, messageText) {
   const message = {
     token: fcmToken,
-    notification: {
-      title: title,
-      body: body,
-    },
+    notification: { title, body },
     data: {
       type: type,
       messageId: messageId,
-      userName: userName,
-      messageText: messageText,
+      userName: userName || '',
+      messageText: messageText || '',
       title: title
     },
     android: {
       priority: 'high',
-      notification: {
-        sound: 'default',
-        priority: 'high'
-      }
+      notification: { sound: 'default', priority: 'high' }
     },
     apns: {
       payload: {
-        aps: {
-          sound: 'default',
-          contentAvailable: true
-        }
+        aps: { sound: 'default', contentAvailable: true }
       }
     }
   };
-  
   try {
     const response = await admin.messaging().send(message);
     console.log(`✅ Уведомление отправлено: ${title} (${response})`);
@@ -58,60 +48,52 @@ async function sendNotification(fcmToken, title, body, type, messageId, userName
   }
 }
 
+// Вспомогательная функция: определить статус захода (активный, просрочен, завершён)
+function getEntryStatus(msg) {
+  // Если есть выход – завершён
+  if (msg.actualExitDisplay) return 'completed';
+  // Если нет КВ или КВ = "без КВ" – активный без просрочки
+  if (!msg.controlDate || msg.controlDate === 'no_kv') return 'active';
+  // Сравниваем текущее московское время с КВ
+  const now = new Date();
+  const controlDateTime = new Date(`${msg.controlDate}T${msg.controlTime}:00+03:00`);
+  return now >= controlDateTime ? 'active-overdue' : 'active';
+}
+
 // Слушаем изменения в коллекции messages
 console.log('🔍 Начинаем прослушивание коллекции messages...');
 
 db.collection('messages').onSnapshot(async (snapshot) => {
   console.log(`📨 Получено изменение: ${snapshot.docChanges().length} изменений`);
-  
-  // Используем for...of для корректной обработки асинхронных операций
+
   for (const change of snapshot.docChanges()) {
+    const messageId = change.doc.id;
+    const message = change.doc.data();
+
     if (change.type === 'added') {
-      const message = change.doc.data();
-      const messageId = change.doc.id;
-      
-      console.log(`📨 Новое сообщение от ${message.userName}: ${message.text?.substring(0, 50)}...`);
-      
-      // Игнорируем служебные сообщения о заходе
+      // --- Обработка новых сообщений (упоминания, ответы) ---
       if (message.type === 'entry') {
-        console.log('⏩ Пропускаем служебное сообщение');
+        console.log('⏩ Пропускаем служебное сообщение о заходе');
         continue;
       }
-      
       const text = message.text || '';
-      
-      // ========== 1. Поиск упоминаний (исправленное регулярное выражение) ==========
-      // Поддерживает форматы @[Имя Пользователя] и @Имя
+
+      // 1. Упоминания
       const mentionRegex = /@\[([^\]]+)\]|@([\wа-яА-ЯёЁ]+)/g;
       let match;
       while ((match = mentionRegex.exec(text)) !== null) {
-        // Имя может быть в группе 1 (если формат @[...]) или в группе 2 (если @слово)
         const username = (match[1] || match[2]).trim();
         if (!username) continue;
-        
-        console.log(`🔍 Поиск пользователя: ${username}`);
-        
-        // Ищем пользователя по имени (регистронезависимый поиск)
+        console.log(`🔍 Поиск пользователя для упоминания: ${username}`);
         const userQuery = await db.collection('users')
           .where('name', '==', username)
           .limit(1)
           .get();
-          
         if (!userQuery.empty) {
           const userDoc = userQuery.docs[0];
           const userId = userDoc.id;
           const fcmToken = userDoc.data().fcmToken;
-          
-          console.log(`📱 Найден пользователь ${username}, fcmToken: ${fcmToken ? 'есть' : 'нет'}`);
-          
-          // Не отправляем уведомление автору сообщения
-          if (userId === message.userId) {
-            console.log(`⏩ Не отправляем уведомление автору сообщения`);
-            continue;
-          }
-          
-          if (fcmToken) {
-            console.log(`📤 Отправка уведомления об упоминании для ${username}`);
+          if (userId !== message.userId && fcmToken) {
             await sendNotification(
               fcmToken,
               `🔔 Упоминание в чате`,
@@ -121,33 +103,23 @@ db.collection('messages').onSnapshot(async (snapshot) => {
               message.userName,
               text
             );
-          } else {
-            console.log(`⚠️ Нет FCM токена для пользователя ${username}`);
           }
-        } else {
-          console.log(`❌ Пользователь ${username} не найден`);
         }
       }
-      
-      // ========== 2. Обработка ответов ==========
+
+      // 2. Ответы
       if (message.replyTo && message.replyTo.author) {
         const repliedAuthor = message.replyTo.author;
-        console.log(`🔍 Ответ на сообщение пользователя: ${repliedAuthor}`);
-        
+        console.log(`🔍 Поиск пользователя для ответа: ${repliedAuthor}`);
         const userQuery = await db.collection('users')
           .where('name', '==', repliedAuthor)
           .limit(1)
           .get();
-          
         if (!userQuery.empty) {
           const userDoc = userQuery.docs[0];
           const userId = userDoc.id;
           const fcmToken = userDoc.data().fcmToken;
-          
-          console.log(`📱 Найден пользователь ${repliedAuthor}, fcmToken: ${fcmToken ? 'есть' : 'нет'}`);
-          
           if (userId !== message.userId && fcmToken) {
-            console.log(`📤 Отправка уведомления об ответе для ${repliedAuthor}`);
             await sendNotification(
               fcmToken,
               `💬 Ответ на ваше сообщение`,
@@ -158,8 +130,41 @@ db.collection('messages').onSnapshot(async (snapshot) => {
               text
             );
           }
-        } else {
-          console.log(`❌ Пользователь ${repliedAuthor} не найден`);
+        }
+      }
+    } 
+    else if (change.type === 'modified') {
+      // --- НОВОЕ: Обработка изменений захода (просрочка) ---
+      if (message.type === 'entry' && !message.actualExitDisplay) {
+        const status = getEntryStatus(message);
+        // Если статус "просрочен" и уведомление ещё не отправлено
+        if (status === 'active-overdue' && !message.overdueNotified) {
+          // Проверяем, взят ли контроль
+          if (message.controlTakenBy && message.controlTakenBy.userId) {
+            const controllerId = message.controlTakenBy.userId;
+            const controllerName = message.controlTakenBy.userName;
+            // Получаем FCM токен того, кто взял контроль
+            const userDoc = await db.collection('users').doc(controllerId).get();
+            const fcmToken = userDoc.exists ? userDoc.data().fcmToken : null;
+            if (fcmToken) {
+              await sendNotification(
+                fcmToken,
+                `⚠️ Просрочка захода!`,
+                `Заход пользователя ${message.userName} просрочен. Контроль у вас.`,
+                'overdue',
+                messageId,
+                message.userName,
+                ''
+              );
+              // Ставим флаг, чтобы не отправлять повторно
+              await change.doc.ref.update({ overdueNotified: true });
+              console.log(`📤 Отправлено уведомление о просрочке для ${controllerName} (${controllerId})`);
+            } else {
+              console.log(`⚠️ Нет FCM токена для контролёра ${controllerName}`);
+            }
+          } else {
+            console.log(`ℹ️ Заход просрочен, но контроль никем не взят, уведомление не отправлено`);
+          }
         }
       }
     }
