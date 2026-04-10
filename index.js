@@ -1,7 +1,6 @@
 const admin = require('firebase-admin');
 const express = require('express');
 
-// Инициализация Firebase Admin SDK
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
@@ -11,12 +10,13 @@ const db = admin.firestore();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Эндпоинт для проверки работоспособности
+// Время запуска сервера (UTC). Все сообщения с timestamp ДО этого момента игнорируем.
+const SERVER_START_TIME = new Date();
+
 app.get('/', (req, res) => {
   res.send('FCM Notifier is running');
 });
 
-// Функция для отправки уведомления (FCM v1)
 async function sendNotification(fcmToken, title, body, type, messageId, userName, messageText) {
   const message = {
     token: fcmToken,
@@ -48,20 +48,16 @@ async function sendNotification(fcmToken, title, body, type, messageId, userName
   }
 }
 
-// Вспомогательная функция: определить статус захода (активный, просрочен, завершён)
 function getEntryStatus(msg) {
-  // Если есть выход – завершён
   if (msg.actualExitDisplay) return 'completed';
-  // Если нет КВ или КВ = "без КВ" – активный без просрочки
   if (!msg.controlDate || msg.controlDate === 'no_kv') return 'active';
-  // Сравниваем текущее московское время с КВ
   const now = new Date();
   const controlDateTime = new Date(`${msg.controlDate}T${msg.controlTime}:00+03:00`);
   return now >= controlDateTime ? 'active-overdue' : 'active';
 }
 
-// Слушаем изменения в коллекции messages
 console.log('🔍 Начинаем прослушивание коллекции messages...');
+console.log(`🕒 Игнорируем сообщения, созданные до ${SERVER_START_TIME.toISOString()}`);
 
 db.collection('messages').onSnapshot(async (snapshot) => {
   console.log(`📨 Получено изменение: ${snapshot.docChanges().length} изменений`);
@@ -70,8 +66,23 @@ db.collection('messages').onSnapshot(async (snapshot) => {
     const messageId = change.doc.id;
     const message = change.doc.data();
 
+    // --- Пропускаем старые сообщения (только для 'added') ---
     if (change.type === 'added') {
-      // --- Обработка новых сообщений (упоминания, ответы) ---
+      let msgTime = null;
+      if (message.timestamp && message.timestamp.toDate) {
+        msgTime = message.timestamp.toDate();
+      } else if (message.moscowTime) {
+        // fallback: парсим московское время
+        const parsed = new Date(message.moscowTime.replace(' ', 'T') + '+03:00');
+        if (!isNaN(parsed.getTime())) msgTime = parsed;
+      }
+      if (msgTime && msgTime < SERVER_START_TIME) {
+        console.log(`⏩ Пропускаем старое сообщение ${messageId} (${msgTime.toISOString()})`);
+        continue;
+      }
+    }
+
+    if (change.type === 'added') {
       if (message.type === 'entry') {
         console.log('⏩ Пропускаем служебное сообщение о заходе');
         continue;
@@ -134,16 +145,12 @@ db.collection('messages').onSnapshot(async (snapshot) => {
       }
     } 
     else if (change.type === 'modified') {
-      // --- НОВОЕ: Обработка изменений захода (просрочка) ---
       if (message.type === 'entry' && !message.actualExitDisplay) {
         const status = getEntryStatus(message);
-        // Если статус "просрочен" и уведомление ещё не отправлено
         if (status === 'active-overdue' && !message.overdueNotified) {
-          // Проверяем, взят ли контроль
           if (message.controlTakenBy && message.controlTakenBy.userId) {
             const controllerId = message.controlTakenBy.userId;
             const controllerName = message.controlTakenBy.userName;
-            // Получаем FCM токен того, кто взял контроль
             const userDoc = await db.collection('users').doc(controllerId).get();
             const fcmToken = userDoc.exists ? userDoc.data().fcmToken : null;
             if (fcmToken) {
@@ -156,7 +163,6 @@ db.collection('messages').onSnapshot(async (snapshot) => {
                 message.userName,
                 ''
               );
-              // Ставим флаг, чтобы не отправлять повторно
               await change.doc.ref.update({ overdueNotified: true });
               console.log(`📤 Отправлено уведомление о просрочке для ${controllerName} (${controllerId})`);
             } else {
@@ -173,7 +179,6 @@ db.collection('messages').onSnapshot(async (snapshot) => {
   console.error('❌ Ошибка Firestore:', error);
 });
 
-// Запуск сервера
 app.listen(PORT, () => {
   console.log(`✅ FCM Notifier запущен на порту ${PORT}`);
   console.log(`📡 Сервер доступен по адресу: http://localhost:${PORT}`);
