@@ -164,8 +164,8 @@ async function checkOverdueEntries() {
             if (fcmToken) {
               await sendNotification(
                 fcmToken,
-                `⚠️ Просрочка захода!`,
-                `Заход пользователя ${entry.userName} просрочен. Контроль у вас.`,
+                `⚠️ Просрочка выхода!`,
+                `Выход пользователя ${entry.userName} просрочен. Контроль у вас.`,
                 'overdue',
                 entryId,
                 entry.userName,
@@ -179,7 +179,7 @@ async function checkOverdueEntries() {
             }
           } else {
             // Если контроль никем не взят – можно никого не уведомлять (или уведомить всех админов)
-            console.log(`ℹ️ Заход ${entry.userName} просрочен, но контроль никем не взят`);
+            console.log(`ℹ️ Выход ${entry.userName} просрочен, но контроль никем не взят`);
             // По желанию: можно поставить флаг, чтобы не проверять повторно
             await doc.ref.update({ overdueNotified: true });
           }
