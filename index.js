@@ -191,8 +191,8 @@ async function checkOverdueEntries() {
   }
 }
 
-// Запускаем проверку просрочек каждую минуту
-setInterval(checkOverdueEntries, 60 * 1000);
+// Запускаем проверку просрочек каждые 5 минут
+setInterval(checkOverdueEntries, 5 * 60 * 1000);
 // И сразу один раз при старте (на случай, если просрочка уже наступила)
 checkOverdueEntries();
 
