@@ -1,6 +1,7 @@
 const admin = require('firebase-admin');
 const express = require('express');
 
+// Инициализация Firebase Admin SDK
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
@@ -10,13 +11,14 @@ const db = admin.firestore();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Время запуска сервера (UTC). Все сообщения с timestamp ДО этого момента игнорируем.
+// Время запуска сервера (UTC). Используем для фильтрации новых сообщений
 const SERVER_START_TIME = new Date();
 
 app.get('/', (req, res) => {
   res.send('FCM Notifier is running');
 });
 
+// Отправка push-уведомления через FCM v1
 async function sendNotification(fcmToken, title, body, type, messageId, userName, messageText) {
   const message = {
     token: fcmToken,
@@ -48,48 +50,34 @@ async function sendNotification(fcmToken, title, body, type, messageId, userName
   }
 }
 
-function getEntryStatus(msg) {
-  if (msg.actualExitDisplay) return 'completed';
-  if (!msg.controlDate || msg.controlDate === 'no_kv') return 'active';
+// Функция проверки, просрочен ли заход
+function isOverdue(controlDate, controlTime) {
+  if (!controlDate || controlDate === 'no_kv' || !controlTime) return false;
   const now = new Date();
-  const controlDateTime = new Date(`${msg.controlDate}T${msg.controlTime}:00+03:00`);
-  return now >= controlDateTime ? 'active-overdue' : 'active';
+  const controlDateTime = new Date(`${controlDate}T${controlTime}:00+03:00`);
+  return now >= controlDateTime;
 }
 
-console.log('🔍 Начинаем прослушивание коллекции messages...');
-console.log(`🕒 Игнорируем сообщения, созданные до ${SERVER_START_TIME.toISOString()}`);
+// ========== 1. СЛУШАТЕЛЬ ТОЛЬКО ДЛЯ НОВЫХ СООБЩЕНИЙ (упоминания и ответы) ==========
+console.log('🔍 Слушаем ТОЛЬКО новые сообщения (после', SERVER_START_TIME.toISOString(), ')');
+db.collection('messages')
+  .where('timestamp', '>', SERVER_START_TIME)   // Ключевая строка: загружаем только новые
+  .onSnapshot(async (snapshot) => {
+    console.log(`📨 Получено изменение: ${snapshot.docChanges().length} изменений (только новые)`);
+    for (const change of snapshot.docChanges()) {
+      if (change.type !== 'added') continue;   // нас интересуют только новые сообщения
 
-db.collection('messages').onSnapshot(async (snapshot) => {
-  console.log(`📨 Получено изменение: ${snapshot.docChanges().length} изменений`);
+      const message = change.doc.data();
+      const messageId = change.doc.id;
+      const text = message.text || '';
 
-  for (const change of snapshot.docChanges()) {
-    const messageId = change.doc.id;
-    const message = change.doc.data();
-
-    // --- Пропускаем старые сообщения (только для 'added') ---
-    if (change.type === 'added') {
-      let msgTime = null;
-      if (message.timestamp && message.timestamp.toDate) {
-        msgTime = message.timestamp.toDate();
-      } else if (message.moscowTime) {
-        // fallback: парсим московское время
-        const parsed = new Date(message.moscowTime.replace(' ', 'T') + '+03:00');
-        if (!isNaN(parsed.getTime())) msgTime = parsed;
-      }
-      if (msgTime && msgTime < SERVER_START_TIME) {
-        console.log(`⏩ Пропускаем старое сообщение ${messageId} (${msgTime.toISOString()})`);
-        continue;
-      }
-    }
-
-    if (change.type === 'added') {
+      // Пропускаем служебные сообщения о заходах
       if (message.type === 'entry') {
         console.log('⏩ Пропускаем служебное сообщение о заходе');
         continue;
       }
-      const text = message.text || '';
 
-      // 1. Упоминания
+      // --- Обработка упоминаний ---
       const mentionRegex = /@\[([^\]]+)\]|@([\wа-яА-ЯёЁ]+)/g;
       let match;
       while ((match = mentionRegex.exec(text)) !== null) {
@@ -118,7 +106,7 @@ db.collection('messages').onSnapshot(async (snapshot) => {
         }
       }
 
-      // 2. Ответы
+      // --- Обработка ответов ---
       if (message.replyTo && message.replyTo.author) {
         const repliedAuthor = message.replyTo.author;
         console.log(`🔍 Поиск пользователя для ответа: ${repliedAuthor}`);
@@ -143,44 +131,75 @@ db.collection('messages').onSnapshot(async (snapshot) => {
           }
         }
       }
-    } 
-    else if (change.type === 'modified') {
-      if (message.type === 'entry' && !message.actualExitDisplay) {
-        const status = getEntryStatus(message);
-        if (status === 'active-overdue' && !message.overdueNotified) {
-          if (message.controlTakenBy && message.controlTakenBy.userId) {
-            const controllerId = message.controlTakenBy.userId;
-            const controllerName = message.controlTakenBy.userName;
+    }
+  }, (error) => {
+    console.error('❌ Ошибка Firestore (слушатель новых сообщений):', error);
+  });
+
+// ========== 2. ПЕРИОДИЧЕСКАЯ ПРОВЕРКА ПРОСРОЧЕК ЗАХОДОВ (раз в минуту) ==========
+// Не требует загрузки всей истории – запрашиваем только активные заходы без выхода
+async function checkOverdueEntries() {
+  try {
+    // Ищем все незавершённые заходы (без actualExitDisplay)
+    const snapshot = await db.collection('messages')
+      .where('type', '==', 'entry')
+      .where('actualExitDisplay', '==', null)
+      .get();
+
+    for (const doc of snapshot.docs) {
+      const entry = doc.data();
+      const entryId = doc.id;
+      // Если уже отправлено уведомление о просрочке – пропускаем
+      if (entry.overdueNotified) continue;
+
+      // Проверяем, есть ли КВ и не просрочено ли оно
+      if (entry.controlDate && entry.controlDate !== 'no_kv' && entry.controlTime) {
+        if (isOverdue(entry.controlDate, entry.controlTime)) {
+          // Если контроль взят – уведомляем того, кто взял
+          if (entry.controlTakenBy && entry.controlTakenBy.userId) {
+            const controllerId = entry.controlTakenBy.userId;
+            const controllerName = entry.controlTakenBy.userName;
             const userDoc = await db.collection('users').doc(controllerId).get();
             const fcmToken = userDoc.exists ? userDoc.data().fcmToken : null;
             if (fcmToken) {
               await sendNotification(
                 fcmToken,
                 `⚠️ Просрочка захода!`,
-                `Заход пользователя ${message.userName} просрочен. Контроль у вас.`,
+                `Заход пользователя ${entry.userName} просрочен. Контроль у вас.`,
                 'overdue',
-                messageId,
-                message.userName,
+                entryId,
+                entry.userName,
                 ''
               );
-              await change.doc.ref.update({ overdueNotified: true });
+              // Ставим флаг, чтобы больше не отправлять
+              await doc.ref.update({ overdueNotified: true });
               console.log(`📤 Отправлено уведомление о просрочке для ${controllerName} (${controllerId})`);
             } else {
               console.log(`⚠️ Нет FCM токена для контролёра ${controllerName}`);
             }
           } else {
-            console.log(`ℹ️ Заход просрочен, но контроль никем не взят, уведомление не отправлено`);
+            // Если контроль никем не взят – можно никого не уведомлять (или уведомить всех админов)
+            console.log(`ℹ️ Заход ${entry.userName} просрочен, но контроль никем не взят`);
+            // По желанию: можно поставить флаг, чтобы не проверять повторно
+            await doc.ref.update({ overdueNotified: true });
           }
         }
       }
     }
+  } catch (err) {
+    console.error('❌ Ошибка при проверке просрочек:', err);
   }
-}, (error) => {
-  console.error('❌ Ошибка Firestore:', error);
-});
+}
 
+// Запускаем проверку просрочек каждую минуту
+setInterval(checkOverdueEntries, 60 * 1000);
+// И сразу один раз при старте (на случай, если просрочка уже наступила)
+checkOverdueEntries();
+
+// ========== ЗАПУСК СЕРВЕРА ==========
 app.listen(PORT, () => {
   console.log(`✅ FCM Notifier запущен на порту ${PORT}`);
   console.log(`📡 Сервер доступен по адресу: http://localhost:${PORT}`);
+  console.log(`🕒 Игнорируем старые сообщения (до ${SERVER_START_TIME.toISOString()})`);
   console.log('🔍 Ожидание новых сообщений в Firestore...');
 });
