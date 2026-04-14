@@ -137,13 +137,21 @@ db.collection('messages')
   });
 
 // ========== 2. СЛУШАТЕЛЬ ИЗМЕНЕНИЙ СУЩЕСТВУЮЩИХ СООБЩЕНИЙ (реакции) ==========
-// Отслеживаем добавление новых реакций (только когда реакция добавлена, а не удалена)
 console.log('🔍 Запускаем слушатель изменений сообщений (для реакций)');
+// Хранилище уже отправленных уведомлений о реакциях (чтобы не дублировать)
+const sentReactionNotifications = new Set();
+
 db.collection('messages')
   .onSnapshot(async (snapshot) => {
     for (const change of snapshot.docChanges()) {
       if (change.type !== 'modified') continue;
-
+      
+      // ВАЖНО: проверяем, что prev существует (при первой загрузке его может не быть)
+      if (!change.doc.prev) {
+        console.log('ℹ️ Пропускаем изменение без prev данных');
+        continue;
+      }
+      
       const newData = change.doc.data();
       const oldData = change.doc.prev.data();
       const messageId = change.doc.id;
@@ -173,10 +181,15 @@ db.collection('messages')
       const messageAuthorId = newData.userId;
       if (!messageAuthorId) continue;
 
-      // Получаем информацию о пользователе, который поставил реакцию (первый в списке, для простоты)
       const reactorId = addedEmojis[0].userId;
+      // Уникальный ключ для предотвращения дублей (сообщение + реакция + пользователь)
+      const notificationKey = `${messageId}_${reactorId}_${addedEmojis.map(e=>e.emoji).join(',')}`;
+      if (sentReactionNotifications.has(notificationKey)) {
+        console.log(`ℹ️ Уведомление уже отправлено: ${notificationKey}`);
+        continue;
+      }
+
       if (reactorId === messageAuthorId) {
-        // Не отправляем уведомление, если пользователь поставил реакцию на своё сообщение
         console.log(`ℹ️ Пользователь ${reactorId} поставил реакцию на своё сообщение — уведомление не требуется`);
         continue;
       }
@@ -207,6 +220,14 @@ db.collection('messages')
         shortMessageText,
         emojiList
       );
+      
+      // Запоминаем, что уведомление отправлено
+      sentReactionNotifications.add(notificationKey);
+      // Очищаем старые ключи (не более 1000)
+      if (sentReactionNotifications.size > 1000) {
+        const toDelete = [...sentReactionNotifications].slice(0, 500);
+        toDelete.forEach(key => sentReactionNotifications.delete(key));
+      }
     }
   }, (error) => {
     console.error('❌ Ошибка слушателя изменений (реакции):', error);
