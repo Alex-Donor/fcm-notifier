@@ -19,7 +19,7 @@ app.get('/', (req, res) => {
 });
 
 // Отправка push-уведомления через FCM v1
-async function sendNotification(fcmToken, title, body, type, messageId, userName, messageText) {
+async function sendNotification(fcmToken, title, body, type, messageId, userName, messageText, reactionEmoji = '') {
   const message = {
     token: fcmToken,
     notification: { title, body },
@@ -28,7 +28,8 @@ async function sendNotification(fcmToken, title, body, type, messageId, userName
       messageId: messageId,
       userName: userName || '',
       messageText: messageText || '',
-      title: title
+      title: title,
+      reactionEmoji: reactionEmoji
     },
     android: {
       priority: 'high',
@@ -61,17 +62,16 @@ function isOverdue(controlDate, controlTime) {
 // ========== 1. СЛУШАТЕЛЬ ТОЛЬКО ДЛЯ НОВЫХ СООБЩЕНИЙ (упоминания и ответы) ==========
 console.log('🔍 Слушаем ТОЛЬКО новые сообщения (после', SERVER_START_TIME.toISOString(), ')');
 db.collection('messages')
-  .where('timestamp', '>', SERVER_START_TIME)   // Ключевая строка: загружаем только новые
+  .where('timestamp', '>', SERVER_START_TIME)
   .onSnapshot(async (snapshot) => {
     console.log(`📨 Получено изменение: ${snapshot.docChanges().length} изменений (только новые)`);
     for (const change of snapshot.docChanges()) {
-      if (change.type !== 'added') continue;   // нас интересуют только новые сообщения
+      if (change.type !== 'added') continue;
 
       const message = change.doc.data();
       const messageId = change.doc.id;
       const text = message.text || '';
 
-      // Пропускаем служебные сообщения о заходах
       if (message.type === 'entry') {
         console.log('⏩ Пропускаем служебное сообщение о заходе');
         continue;
@@ -136,11 +136,85 @@ db.collection('messages')
     console.error('❌ Ошибка Firestore (слушатель новых сообщений):', error);
   });
 
-// ========== 2. ПЕРИОДИЧЕСКАЯ ПРОВЕРКА ПРОСРОЧЕК ЗАХОДОВ (раз в минуту) ==========
-// Не требует загрузки всей истории – запрашиваем только активные заходы без выхода
+// ========== 2. СЛУШАТЕЛЬ ИЗМЕНЕНИЙ СУЩЕСТВУЮЩИХ СООБЩЕНИЙ (реакции) ==========
+// Отслеживаем добавление новых реакций (только когда реакция добавлена, а не удалена)
+console.log('🔍 Запускаем слушатель изменений сообщений (для реакций)');
+db.collection('messages')
+  .onSnapshot(async (snapshot) => {
+    for (const change of snapshot.docChanges()) {
+      if (change.type !== 'modified') continue;
+
+      const newData = change.doc.data();
+      const oldData = change.doc.prev.data();
+      const messageId = change.doc.id;
+
+      // Проверяем, изменилось ли поле reactions
+      const oldReactions = oldData?.reactions || {};
+      const newReactions = newData?.reactions || {};
+
+      // Находим добавленные эмодзи (которых не было в старой версии или увеличилось количество)
+      const addedEmojis = [];
+      for (const [emoji, react] of Object.entries(newReactions)) {
+        const oldCount = oldReactions[emoji]?.count || 0;
+        if (react.count > oldCount) {
+          // Определяем, какой пользователь добавил реакцию (новый в массиве users)
+          const oldUsers = oldReactions[emoji]?.users || [];
+          const newUsers = react.users || [];
+          const addedUser = newUsers.find(uid => !oldUsers.includes(uid));
+          if (addedUser) {
+            addedEmojis.push({ emoji, userId: addedUser, count: react.count });
+          }
+        }
+      }
+
+      if (addedEmojis.length === 0) continue;
+
+      // Для каждого добавленного эмодзи отправляем уведомление автору сообщения
+      const messageAuthorId = newData.userId;
+      if (!messageAuthorId) continue;
+
+      // Получаем информацию о пользователе, который поставил реакцию (первый в списке, для простоты)
+      const reactorId = addedEmojis[0].userId;
+      if (reactorId === messageAuthorId) {
+        // Не отправляем уведомление, если пользователь поставил реакцию на своё сообщение
+        console.log(`ℹ️ Пользователь ${reactorId} поставил реакцию на своё сообщение — уведомление не требуется`);
+        continue;
+      }
+
+      // Получаем данные автора сообщения (чтобы взять его FCM токен)
+      const authorDoc = await db.collection('users').doc(messageAuthorId).get();
+      if (!authorDoc.exists) continue;
+      const fcmToken = authorDoc.data().fcmToken;
+      if (!fcmToken) {
+        console.log(`⚠️ У автора сообщения ${messageAuthorId} нет FCM токена`);
+        continue;
+      }
+
+      // Получаем имя пользователя, поставившего реакцию
+      let reactorName = 'Пользователь';
+      const reactorDoc = await db.collection('users').doc(reactorId).get();
+      if (reactorDoc.exists) reactorName = reactorDoc.data().name || reactorName;
+
+      const emojiList = addedEmojis.map(e => e.emoji).join(', ');
+      const shortMessageText = (newData.text || '').substring(0, 80);
+      await sendNotification(
+        fcmToken,
+        `😊 Новая реакция на ваше сообщение`,
+        `${reactorName} поставил(а) ${emojiList} на: "${shortMessageText}"`,
+        'reaction',
+        messageId,
+        reactorName,
+        shortMessageText,
+        emojiList
+      );
+    }
+  }, (error) => {
+    console.error('❌ Ошибка слушателя изменений (реакции):', error);
+  });
+
+// ========== 3. ПЕРИОДИЧЕСКАЯ ПРОВЕРКА ПРОСРОЧЕК ЗАХОДОВ (раз в минуту) ==========
 async function checkOverdueEntries() {
   try {
-    // Ищем все незавершённые заходы (без actualExitDisplay)
     const snapshot = await db.collection('messages')
       .where('type', '==', 'entry')
       .where('actualExitDisplay', '==', null)
@@ -149,13 +223,10 @@ async function checkOverdueEntries() {
     for (const doc of snapshot.docs) {
       const entry = doc.data();
       const entryId = doc.id;
-      // Если уже отправлено уведомление о просрочке – пропускаем
       if (entry.overdueNotified) continue;
 
-      // Проверяем, есть ли КВ и не просрочено ли оно
       if (entry.controlDate && entry.controlDate !== 'no_kv' && entry.controlTime) {
         if (isOverdue(entry.controlDate, entry.controlTime)) {
-          // Если контроль взят – уведомляем того, кто взял
           if (entry.controlTakenBy && entry.controlTakenBy.userId) {
             const controllerId = entry.controlTakenBy.userId;
             const controllerName = entry.controlTakenBy.userName;
@@ -171,16 +242,13 @@ async function checkOverdueEntries() {
                 entry.userName,
                 ''
               );
-              // Ставим флаг, чтобы больше не отправлять
               await doc.ref.update({ overdueNotified: true });
               console.log(`📤 Отправлено уведомление о просрочке для ${controllerName} (${controllerId})`);
             } else {
               console.log(`⚠️ Нет FCM токена для контролёра ${controllerName}`);
             }
           } else {
-            // Если контроль никем не взят – можно никого не уведомлять (или уведомить всех админов)
             console.log(`ℹ️ Выход ${entry.userName} просрочен, но контроль никем не взят`);
-            // По желанию: можно поставить флаг, чтобы не проверять повторно
             await doc.ref.update({ overdueNotified: true });
           }
         }
@@ -191,9 +259,7 @@ async function checkOverdueEntries() {
   }
 }
 
-// Запускаем проверку просрочек каждые 5 минут
 setInterval(checkOverdueEntries, 5 * 60 * 1000);
-// И сразу один раз при старте (на случай, если просрочка уже наступила)
 checkOverdueEntries();
 
 // ========== ЗАПУСК СЕРВЕРА ==========
@@ -201,5 +267,5 @@ app.listen(PORT, () => {
   console.log(`✅ FCM Notifier запущен на порту ${PORT}`);
   console.log(`📡 Сервер доступен по адресу: http://localhost:${PORT}`);
   console.log(`🕒 Игнорируем старые сообщения (до ${SERVER_START_TIME.toISOString()})`);
-  console.log('🔍 Ожидание новых сообщений в Firestore...');
+  console.log('🔍 Ожидание новых сообщений и реакций в Firestore...');
 });
